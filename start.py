@@ -27,24 +27,7 @@ print(spotReq.text)
 # scheduler init
 scheduler = sched.scheduler(time.time, time.sleep)
 
-def sendRGBTick(hexvalue):
 
-    if not len(hexvalue) == 6:
-        print('invalid hex value')
-        return
-
-    print(hexvalue)
-
-    #TODO: check if every value is a valid hex value (0 -> F)
-
-    redvalue = hexvalue[0:2]*4
-    greenvalue = hexvalue[2:4]*4
-    bluevalue = hexvalue[4:6]*4
-
-    subprocess.call([binary] + [redvalue, greenvalue, bluevalue])
-
-
-# sequence loading from file
 def readSequenceFile(filepath):
 
     sequencefile = open(filepath, 'r')
@@ -56,7 +39,7 @@ def readSequenceFile(filepath):
 
     sequenceData = []
 
-    for linedata in seq_lines:
+    for idx, linedata in enumerate(seq_lines):
 
         splitLine = linedata.split()
 
@@ -73,17 +56,41 @@ def readSequenceFile(filepath):
             start_offset = splitLine[1]
             continue
 
-        # data parsing
-        if not len(splitLine) == 3:
-            print('Sequence data file is corrupted')
+        # data line checking
+        if len(splitLine) < 3 or len(splitLine) > 5:
+            print('Sequence data file is corrupted: line %d with invalid length' % (idx + 1))
             exit()
 
-        sequenceData.append([splitLine[0], splitLine[1], splitLine[2]])
+        # color code validation
+        if len(splitLine[2]) != 6:
+            print('Sequence data file is corrupted: line %d has an invalid color code length (has to be three bytes)' % (idx + 1))
+            exit()
+
+        try:
+            int(splitLine[2], 16)
+        except:
+            print('Sequence data file is corrupted: line %d has an invalid hex color code' % (idx + 1))
+            exit()
+
+        # effects
+        effectType = None
+        effectDuration = None
+
+        if len(splitLine) > 3:
+
+            if(splitLine[3] != 'I' and splitLine[3] != 'O'):
+                print('Sequence data file is corrupted: line %d has an invalid effect identifier' % (idx + 1))
+                exit()
+
+            effectType = splitLine[3]
+            effectDuration = splitLine[4]
+
+        sequenceData.append([splitLine[0], splitLine[1], splitLine[2], effectType, effectDuration])
 
     return sequenceData, tempo, interval, start_offset
 
 
-def insertSequenceTiming(sequence_data):
+def encodeData(sequence_data):
 
     # set metadata
     tempo = int(sequence_data[1]) if sequence_data[1] is not None else 120
@@ -93,23 +100,61 @@ def insertSequenceTiming(sequence_data):
     # timing
     time_interval = (60 / tempo) / interval
 
-    # set scheduled times
+    # set notes
     note_data = []
 
-    for instruction in sequence_data[0]:
+    for idx_instr, instruction in enumerate(sequence_data[0]):
 
         time_start = start_offset + float(instruction[0]) * time_interval
         time_end = time_start + float(instruction[1]) * time_interval
 
         note_data.append([time_start, time_end, instruction[2]])
 
-    # fill out empty spaces
+        # effects integration
+        if instruction[3] == 'O':
+
+            gradient_steps = int( int(instruction[4]) / 5)
+
+            current_intensity_red = instruction[2][0:2]
+            current_intensity_green = instruction[2][2:4]
+            current_intensity_blue = instruction[2][4:6]
+
+            current_timestart_offset = 0
+
+            for step_idx in range(gradient_steps):
+
+                # check if the effect is between notes
+                time_start_effect = time_end + ( current_timestart_offset / 1000 )
+                time_end_effect =   time_end + ( (current_timestart_offset + gradient_steps ) / 1000 )
+
+                next_time_start = 0
+
+                if not len(sequence_data[0]) - 1 == idx_instr :
+
+                    next_time_start = start_offset + float(sequence_data[0][idx_instr + 1][0]) * time_interval
+
+                if time_start_effect < next_time_start or len(sequence_data[0]) - 1 == idx_instr :
+
+                    current_intensity_red =   format( int( int(current_intensity_red, 16) * ( (gradient_steps - step_idx) / gradient_steps )), '02x')
+                    current_intensity_green = format( int( int(current_intensity_green, 16) * ( (gradient_steps - step_idx) / gradient_steps )), '02x')
+                    current_intensity_blue =  format( int( int(current_intensity_blue, 16) * ( (gradient_steps - step_idx) / gradient_steps )), '02x')
+
+                    calculated_intensity = ( str(current_intensity_red) + str(current_intensity_green) + str(current_intensity_blue) ).upper()
+
+                    note_data.append([time_start_effect, time_end_effect, calculated_intensity])
+                    current_timestart_offset += gradient_steps
+
+
+        #TODO: make elif for fade in effect
+
+    
     for i in range(len(note_data)):
 
         scheduler.enter(note_data[i][0], 1, sendRGBTick, argument=(note_data[i][2],))
 
-        if not len(note_data) - 1 == i:
+        if not len(note_data) - 1 == i :
 
+            # fill out empty spaces
             if (note_data[i+1][0] - note_data[i][1]) >= (time_interval - 0.005) : # time interval minus constant makes room for precisionless dif.
                 scheduler.enter(note_data[i][1] + 0.001, 1, sendRGBTick, argument=('000000',))
 
@@ -117,17 +162,35 @@ def insertSequenceTiming(sequence_data):
             scheduler.enter(note_data[i][1] + 0.001, 1, sendRGBTick, argument=('000000',))
 
 
+def sendRGBTick(hexvalue):
+
+    if verbose:
+        print(hexvalue)
+
+    redvalue = hexvalue[0:2]*4
+    greenvalue = hexvalue[2:4]*4
+    bluevalue = hexvalue[4:6]*4
+
+    subprocess.call([binary] + [redvalue, greenvalue, bluevalue] + ['-d', '511'])
+
+
 ### program startup
+###################
 
 sequence_file = './sequence_sample.rgbseq'
 
 # params
 params = sys.argv
 
-if params[0] == '-play' and params[1]:
-    sequence_file = params[1]
+idx_play = params.index('--play') if '--play' in params else None
+
+if params[idx_play + 1]:
+    sequence_file = params[idx_play + 1]
+
+verbose = True if '--verbose' in params else False
 
 
-seq_data = readSequenceFile(sequence_file)
-insertSequenceTiming(seq_data)
-scheduler.run()
+# init
+sequence_data = readSequenceFile(sequence_file)
+encodeData(sequence_data)
+scheduler.run() # play sequence
